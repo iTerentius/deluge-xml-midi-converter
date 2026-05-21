@@ -270,7 +270,11 @@ def convert(xml_path, output_dir=None):
             next_ch[0] += 1
         return synth_channels[preset_name]
 
+    # clip_lookup[global_idx] = (channel, note_events, cc_lanes, clip_length)
+    clip_lookup: dict[int, tuple] = {}
+
     # {track_key: [(section_int, clip_length, channel, note_events, cc_lanes)]}
+    # kept as fallback when no arrangement data is present
     track_data: dict[str, list] = defaultdict(list)
 
     all_clips = root.findall(".//sessionClips/instrumentClip")
@@ -340,6 +344,9 @@ def convert(xml_path, output_dir=None):
                     if events:
                         cc_lanes[cc_num] = events
 
+        # Always register in lookup so arrangement can reference empty clips
+        clip_lookup[idx] = (channel, note_events, cc_lanes, clip_length)
+
         if not note_events and not cc_lanes:
             continue
 
@@ -370,31 +377,100 @@ def convert(xml_path, output_dir=None):
 
         track_data[track_key].append((int(section), clip_length, channel, note_events, cc_lanes))
 
-    # ── Write per-track files (clips concatenated in section order) ──────────
+    # ── Read arrangement from clipInstances on each instrument ───────────────
+    # Format: N × 12 bytes big-endian: start_tick (u32) | arr_length (u32) | clip_idx (u32)
+    # arr_length may be a multiple of the clip's natural length (clip loops).
+    arrangement: dict[str, list] = {}   # preset_name → [(start, arr_len, clip_idx), ...]
+    instruments_el = root.find("instruments")
+    if instruments_el is not None:
+        for instr in instruments_el:
+            ci = instr.get("clipInstances", "")
+            if not ci:
+                continue
+            name = instr.get("presetName", "")
+            raw  = _hex_bytes(ci)
+            instances = []
+            for i in range(0, len(raw) - 11, 12):
+                start, arr_len, clip_idx = struct.unpack(">III", raw[i:i+12])
+                instances.append((start, arr_len, clip_idx))
+            if instances:
+                arrangement[name] = instances
+
+    # ── Write per-track files ────────────────────────────────────────────────
     print()
     track_count = 0
-    for track_key, entries in track_data.items():
-        entries.sort(key=lambda e: e[0])
-        channel = entries[0][2]
 
-        merged_notes = []
-        merged_cc: dict[int, list] = defaultdict(list)
-        offset = 0
-        for _, clip_length, _, n_evts, cc_evts in entries:
-            for midi_note, pos, length, vel in n_evts:
-                merged_notes.append((midi_note, pos + offset, length, vel))
-            for cc_num, evts in cc_evts.items():
-                merged_cc[cc_num].extend((tick + offset, cc_val) for tick, cc_val in evts)
-            offset += clip_length
+    if arrangement:
+        # Arrangement mode: place each clip instance at its timeline position,
+        # looping the clip pattern for the full arr_length.
+        print(f"Arrangement data found — writing {len(arrangement)} track(s) from timeline.\n")
+        for preset_name, instances in arrangement.items():
+            merged_notes: list = []
+            merged_cc: dict[int, list] = defaultdict(list)
+            channel = None
 
-        track_path = tracks_dir / f"{make_safe(stem)}_{make_safe(track_key)}.mid"
-        write_midi(track_path, channel, track_key, tempo_us, merged_notes, dict(merged_cc))
+            for start_tick, arr_len, clip_idx in instances:
+                if clip_idx not in clip_lookup:
+                    continue
+                ch, note_events, cc_lanes, clip_length = clip_lookup[clip_idx]
+                if channel is None:
+                    channel = ch
+                if not note_events and not cc_lanes:
+                    continue
 
-        total_notes = sum(len(e[3]) for e in entries)
-        total_cc    = sum(len(e[4]) for e in entries)
-        cc_info = f", {total_cc} CC lanes" if total_cc else ""
-        print(f"  track {track_path.name}  ({len(entries)} clips, {total_notes} notes{cc_info}, ch {channel + 1})")
-        track_count += 1
+                num_loops = arr_len // clip_length
+                remainder = arr_len % clip_length
+
+                for loop in range(num_loops):
+                    off = start_tick + loop * clip_length
+                    for midi_note, pos, length, vel in note_events:
+                        merged_notes.append((midi_note, pos + off, length, vel))
+                    for cc_num, evts in cc_lanes.items():
+                        merged_cc[cc_num].extend((t + off, v) for t, v in evts)
+
+                if remainder > 0:
+                    off = start_tick + num_loops * clip_length
+                    for midi_note, pos, length, vel in note_events:
+                        if pos < remainder:
+                            merged_notes.append((midi_note, pos + off, min(length, remainder - pos), vel))
+                    for cc_num, evts in cc_lanes.items():
+                        merged_cc[cc_num].extend((t + off, v) for t, v in evts if t < remainder)
+
+            if channel is None or (not merged_notes and not merged_cc):
+                continue
+
+            track_path = tracks_dir / f"{make_safe(stem)}_{make_safe(preset_name)}.mid"
+            write_midi(track_path, channel, preset_name, tempo_us, merged_notes, dict(merged_cc))
+
+            cc_info = f", {sum(len(v) for v in merged_cc.values())} CC pts" if merged_cc else ""
+            print(f"  track {track_path.name}  ({len(instances)} instances, {len(merged_notes)} notes{cc_info}, ch {channel + 1})")
+            track_count += 1
+
+    else:
+        # Fallback: no arrangement data — concatenate session clips in section order
+        print("No arrangement data — writing tracks from session clips in section order.\n")
+        for track_key, entries in track_data.items():
+            entries.sort(key=lambda e: e[0])
+            channel = entries[0][2]
+
+            merged_notes = []
+            merged_cc: dict[int, list] = defaultdict(list)
+            offset = 0
+            for _, clip_length, _, n_evts, cc_evts in entries:
+                for midi_note, pos, length, vel in n_evts:
+                    merged_notes.append((midi_note, pos + offset, length, vel))
+                for cc_num, evts in cc_evts.items():
+                    merged_cc[cc_num].extend((tick + offset, cc_val) for tick, cc_val in evts)
+                offset += clip_length
+
+            track_path = tracks_dir / f"{make_safe(stem)}_{make_safe(track_key)}.mid"
+            write_midi(track_path, channel, track_key, tempo_us, merged_notes, dict(merged_cc))
+
+            total_notes = sum(len(e[3]) for e in entries)
+            total_cc    = sum(len(e[4]) for e in entries)
+            cc_info = f", {total_cc} CC lanes" if total_cc else ""
+            print(f"  track {track_path.name}  ({len(entries)} clips, {total_notes} notes{cc_info}, ch {channel + 1})")
+            track_count += 1
 
     print(f"\n{clip_count} clip files  → {clips_dir}/")
     print(f"{track_count} track files → {tracks_dir}/")
